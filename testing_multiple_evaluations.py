@@ -17,6 +17,8 @@ from transformers import (
     AutoTokenizer, Qwen2ForCausalLM, Qwen2Model, PreTrainedModel)
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 ### Define CAD-Recode model
 
 class FourierPointEncoder(nn.Module):
@@ -181,17 +183,21 @@ def run_cad_recode(tokenizer, model, point_cloud):
 ### Execute predicted python code to raise a CAD model
 
 def eval_str(py_string, out_file):
-    exec(py_string, globals())
-    compound = globals()['r'].val()
+    try:
+        exec(py_string, globals())
+        compound = globals()['r'].val()
+        
+        vertices, faces = compound.tessellate(0.001, 0.1)
+        mesh = trimesh.Trimesh([(v.x, v.y, v.z) for v in vertices], faces)
+        mesh.export(out_file)
     
-    vertices, faces = compound.tessellate(0.001, 0.1)
-    mesh = trimesh.Trimesh([(v.x, v.y, v.z) for v in vertices], faces)
-    mesh.export(out_file)
+    except Exception as e:
+        print(e)
     
 ### Compute IoU and Chamfer distance metrics
 
 def compute_chamfer_distance(gt_mesh, pred_mesh):
-    pred_mesh.apply_transform(trimesh.transformations.scale_matrix(1 / 50 / 2))
+    pred_mesh.apply_transform(trimesh.transformations.scale_matrix(1 / 2))
     pred_mesh.apply_transform(trimesh.transformations.translation_matrix([0.5, 0.5, 0.5]))
     gt_mesh.apply_transform(trimesh.transformations.scale_matrix(1 / 2))
     gt_mesh.apply_transform(trimesh.transformations.translation_matrix([0.5, 0.5, 0.5]))
@@ -213,7 +219,7 @@ def compute_chamfer_distance(gt_mesh, pred_mesh):
     gt_volume = sum(m.volume for m in gt_mesh.split())
     pred_volume = sum(m.volume for m in pred_mesh.split())
     union_volume = gt_volume + pred_volume - intersection_volume
-    iou = intersection_volume / union_volume
+    iou = intersection_volume / (union_volume + 1e-7)
 
     print(f'CD: {cd * 1000:.3f}, IoU: {iou:.3f}')
     return cd * 1000, iou
@@ -229,7 +235,7 @@ def main():
     file_paths = [path for path in file_paths if os.path.isfile(path)]
     
     for file_path in tqdm(file_paths):
-        print(f'\nProcessing file: {file_path}')
+        print(f'## Processing file: {file_path} ##')
         base_sample_id = os.path.basename(file_path).split('.')[0]
         results_dir = '/app/test_data_results/' + base_sample_id
         if not os.path.exists(results_dir):
@@ -237,10 +243,8 @@ def main():
         
         for attempt in tqdm(range(num_attempts_per_file)):
             pc = load_input_pc(stl_path=file_path, seed=attempt*12)
-            print("Done getting PC")
 
             py_string = run_cad_recode(tokenizer, model, pc)
-            print(py_string)
             out_file = os.path.join(results_dir, f'attempt_{attempt}.stl')
             
             process = Process(target=eval_str, args=(py_string, out_file))
@@ -252,12 +256,22 @@ def main():
                 
             if os.path.exists(out_file):
                 gt_mesh = trimesh.load_mesh(file_path, 'obj')
-                pred_mesh = trimesh.load_mesh(out_file)
-                cd, iou = compute_chamfer_distance(gt_mesh, pred_mesh)
+                gt_mesh.apply_translation(-(gt_mesh.bounds[0] + gt_mesh.bounds[1]) / 2.0)
+                gt_mesh.apply_scale(2.0 / max(gt_mesh.extents))
+                
+                try:
+                    pred_mesh = trimesh.load_mesh(out_file)
+                    pred_mesh.apply_translation(-(pred_mesh.bounds[0] + pred_mesh.bounds[1]) / 2.0)
+                    pred_mesh.apply_scale(2.0 / max(pred_mesh.extents))
 
-                with open(out_file.replace('.stl', '.txt'), 'w') as f:
-                    f.write(f'CD (x1e3): {cd}\nIoU: {iou}\n\nCode:\n')
-                    f.write(py_string)
+                    cd, iou = compute_chamfer_distance(gt_mesh, pred_mesh)
+
+                    with open(out_file.replace('.stl', '.txt'), 'w') as f:
+                        f.write(f'CD (x1e3): {cd}\nIoU: {iou}\n\nCode:\n')
+                        f.write(py_string)
+                        
+                except Exception as e:
+                    print(e)
                                 
 
 if __name__ == '__main__':
